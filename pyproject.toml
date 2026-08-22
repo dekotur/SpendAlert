@@ -1,0 +1,32 @@
+# Tool configuration only. SpendAlert runs as a set of scripts rather than an
+# installed package, so there is deliberately no [project] table and no build
+# backend here — `pip install .` is not part of the supported quick start.
+
+[tool.ruff]
+target-version = "py310"  # oldest runtime in the CI matrix
+line-length = 100
+extend-exclude = [".venv", "venv"]
+
+[tool.ruff.lint]
+# Pyflakes plus the pycodestyle rules that catch real mistakes. The broader
+# default rule set is intentionally not enabled: BLE001 would fight the wide
+# `except Exception` handlers that keep a long-running poller alive after one
+# malformed update, and the DTZ rules would flag the naive-UTC storage
+# convention the schema is built on. Both are documented decisions, not
+# oversights, and a linter that has to be argued with every commit stops
+# being read.
+select = ["E4", "E7", "E9", "F", "W"]
+ignore = [
+    # `Expense.is_active == True` is the honest form in a SQLAlchemy filter:
+    # the bare attribute reads like a Python truth test but compiles to SQL.
+    "E712",
+    # `l` as the loop variable of a short comprehension over note lines.
+    "E741",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The regression suite has to point DATABASE_URL at a throwaway file *before*
+# importing `database`, which binds its engine at import time — so its imports
+# genuinely cannot all sit at the top of the file (E402). Paired setup
+# statements on one line keep long fixtures readable (E702).
+"test_bot.py" = ["E402", "E702"]

@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"
+     role="img" aria-label="SpendAlert">
+  <title>SpendAlert</title>
+  <defs>
+    <linearGradient id="halo-field" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6D28D9"/>
+      <stop offset=".52" stop-color="#4A72E8"/>
+      <stop offset="1" stop-color="#22D3EE"/>
+    </linearGradient>
+    <radialGradient id="halo-sheen" cx=".24" cy=".14" r=".58">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity=".26"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- field: full-bleed square. Telegram crops it to the inscribed circle. -->
+  <rect width="512" height="512" fill="url(#halo-field)"/>
+  <rect width="512" height="512" fill="url(#halo-sheen)"/>
+
+  <!-- orbit ring: the recurring cycle -->
+  <circle cx="256" cy="256" r="170" fill="none" stroke="#FFFFFF" stroke-opacity=".32" stroke-width="6"/>
+
+  <!-- bell: frosted white. Group opacity (not fill-opacity) so the clapper
+       overlap does not composite into a brighter patch. -->
+  <g fill="#FFFFFF" opacity=".94">
+    <circle cx="256" cy="148" r="17"/>
+    <path d="M256 165c-38 0-64 30-64 68v51l-21 30h170l-21-30v-51c0-38-26-68-64-68Z"/>
+    <circle cx="256" cy="315" r="30"/>
+  </g>
+</svg>

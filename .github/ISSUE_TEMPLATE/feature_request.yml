@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose a user outcome, not only an implementation detail.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the user problem and desired outcome. Use synthetic examples only; do not include credentials or real user data.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Who has this problem, in which situation, and why do current flows not solve it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe what the user should be able to accomplish.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Possible approach
+      description: Optional implementation or UX direction.
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Privacy, reliability and migration considerations
+      description: Note external data sharing, storage changes, compatibility or reminder behavior risks.

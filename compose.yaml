@@ -1,0 +1,12 @@
+services:
+  spendalert:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - spendalert-data:/data
+
+volumes:
+  spendalert-data:
+
