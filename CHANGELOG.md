@@ -2,6 +2,42 @@
 
 All notable public changes are documented here.
 
+## 1.1.0 - 2026-09-08
+
+### Added
+
+- Voice messages. With the assistant on, a Telegram voice note is
+  transcribed through OpenRouter Whisper and handled exactly like the same
+  words typed: same AI-mode gate, same conversation gate, same rate limit
+  (charged before any audio is downloaded), and one dialogue turn per note.
+  Audio is streamed to the provider and never written to disk. Configurable
+  with `OPENROUTER_STT_MODEL` and `OPENROUTER_TRANSCRIBE_URL`; it reuses
+  `OPENROUTER_API_KEY`, so nothing new is required to keep the assistant off.
+
+### Fixed
+
+- A second `/settings` while the settings menu was still open did nothing.
+  The menu's waiting state matches inline buttons only, so the repeated
+  command matched neither the state handlers nor `/cancel` and was dropped
+  in silence until the user cancelled or changed a setting.
+- Text sent while a step with buttons was open (the settings menu, the
+  reminder-plan editor) vanished without a word, which looked like a broken
+  assistant. The bot now says the step is still open and how to leave it.
+- The assistant could answer in the wrong language when the input arrived in
+  another one - a forwarded message, a quote, or a transcribed voice note.
+  The interface language is now restated on every call instead of relying on
+  a single line inside the static prompt.
+
+### Changed
+
+- First-contact copy (`/start`, `/help`, `/ai`, the empty `/list`, the
+  command menu and the short description) now says "write as in a normal
+  chat" instead of naming internal concepts like free text, and mentions
+  voice messages where they are relevant.
+- The regression suite is 56 groups: voice transcription contract, voice
+  routing and rate limiting, the reply-language block, and `/settings`
+  reentry.
+
 ## 1.0.0 - 2026-08-22
 
 First public release.

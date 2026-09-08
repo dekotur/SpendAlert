@@ -14,7 +14,7 @@ Include tests, reproducible steps, or screenshots made only with synthetic data.
 
 - [ ] I ran `python scripts/security_audit.py`.
 - [ ] I ran `ruff check .` and it passed.
-- [ ] I ran `python test_bot.py` and all 52 groups passed.
+- [ ] I ran `python test_bot.py` and all 56 groups passed.
 - [ ] I ran `python -m compileall -q .` and `git diff --check`.
 - [ ] I inspected `git status --short` before committing.
 - [ ] I added no real token, chat ID, key, database, log, backup, `.ics`, local path, hostname, IP, or user data.

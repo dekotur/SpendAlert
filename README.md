@@ -64,7 +64,7 @@ chose, and roll the date forward correctly when it is done.
 - RUB, USD, EUR, GBP, CNY with converted totals;
 - calendar import from `.ics` files;
 - Fernet encryption for titles, amounts, AI sessions and rollback snapshots;
-- optional AI assistant through OpenRouter;
+- optional AI assistant through OpenRouter, including voice messages;
 - per-user isolation and undo snapshots;
 - runs as plain Python or under Docker Compose.
 
@@ -159,7 +159,7 @@ python scripts/security_audit.py
 python test_bot.py
 ```
 
-Expected output: `Security audit passed` and `All 52 test groups passed`. The
+Expected output: `Security audit passed` and `All 56 test groups passed`. The
 suite uses a throwaway database and a throwaway key — it never touches your real
 data, and it needs no token and no `.env`.
 
@@ -191,6 +191,7 @@ round-trip you can check by hand:
 | Snooze | Tap `↪️ +3 hours` or `↪️ Tomorrow` on a reminder | The due time moves; no duplicate record is created |
 | Calendar import | Send a synthetic `.ics` file | The event becomes a task at the right local date and time |
 | AI assistant | Configure OpenRouter, run `/ai`, then type `what is coming up` | Free-text mode answers from your own records only |
+| Voice message | With `/ai` on, hold the microphone and say `task doctor tomorrow` | The note is transcribed and handled exactly like the same words typed |
 
 ## Run with Docker
 
@@ -232,6 +233,8 @@ development.
 | `OPENROUTER_API_KEY` | no | Enables the `/ai` assistant |
 | `OPENROUTER_MODEL` | no | OpenRouter model id |
 | `OPENROUTER_URL` | no | Endpoint of an OpenRouter-compatible API |
+| `OPENROUTER_STT_MODEL` | no | Speech-to-text model for voice messages |
+| `OPENROUTER_TRANSCRIBE_URL` | no | Endpoint of the speech-to-text API |
 | `ADMIN_CHAT_ID` | no | Chat that receives operational alerts |
 | `DATABASE_URL` | no | SQLite URL; defaults to a file in the state directory |
 | `SPENDALERT_DATA_DIR` | no | Where database, logs, cache and backups live |
@@ -240,7 +243,8 @@ development.
 | `DISK_FREE_ALERT_THRESHOLD_MB` | no | Free-space threshold for the disk alert |
 
 Payments, tasks and reminders work with no OpenRouter key at all. Without one,
-`/ai` reports an integration error and nothing else changes.
+`/ai` reports an integration error and nothing else changes. Voice messages
+use the same key and the same account balance as typed requests.
 
 ## Commands
 
@@ -253,7 +257,7 @@ Payments, tasks and reminders work with no OpenRouter key at all. Without one,
 | `/edit ID` | Changes a record and its reminder plan |
 | `/delete ID` | Deletes a record after confirmation |
 | `/settings` | Time zone, currency, quiet hours, reminder hour, sorting |
-| `/ai` | Turns the persistent AI assistant on or off |
+| `/ai` | Turns the persistent AI assistant on or off. While it is on, plain messages and voice messages both reach it |
 | `/privacy` | Explains what is stored, encrypted and sent where |
 | `/help` | Help and examples |
 
@@ -280,6 +284,7 @@ flowchart LR
 | Storage | SQLite in WAL mode, short transactions, a relocatable state directory, daily and per-user snapshots |
 | Data protection | Titles, amounts, AI sessions and snapshots are Fernet-encrypted; the key lives only in the environment |
 | Optional AI | OpenRouter receives the current user's scoped context and nothing else; manual commands never depend on it |
+| Voice input | Only reached when the assistant is already on: the per-user rate limit is charged before any audio is downloaded, so speech-to-text cannot be used to get a free call |
 | Publication safety | CI runs the tests, the linter and a repository secret audit; Dependabot tracks Python, Actions and Docker updates |
 
 | Module | Responsibility |
@@ -289,19 +294,20 @@ flowchart LR
 | `scheduler.py` | APScheduler jobs and reminder delivery |
 | `reminder_plan.py` | Pure reminder-plan model and validation |
 | `reminder_engine.py` | Episode calculation and persisted schedule state |
-| `ai_handler.py` | Optional OpenRouter tool loop and user-scoped context |
+| `ai_handler.py` | Optional OpenRouter tool loop, voice transcription, and user-scoped context |
 | `crypto_utils.py` | Fernet field encryption |
 | `ics_import.py` | Bounded `.ics` parsing |
 | `currency.py` | Exchange-rate cache and conversion |
 | `utils.py`, `config.py` | Dates and time zones; environment contract and paths |
-| `test_bot.py` | Self-contained 52-group regression suite |
+| `test_bot.py` | Self-contained 56-group regression suite |
 
 ### Deliberate limits
 
 - single-instance self-hosted app, not a horizontally scalable SaaS;
 - dates and scheduling metadata are not encrypted — the scheduler needs to query
   them by time;
-- AI mode sends the context described in `/privacy` to an external provider;
+- AI mode sends the context described in `/privacy` to an external provider,
+  and a voice message sends its audio there to be transcribed;
 - Telegram long polling only: no webhook deployment and no web UI.
 
 ## Data and privacy
@@ -319,8 +325,10 @@ alone cannot restore anything.
 
 Self-hosted does not mean zero-knowledge: the running process decrypts data to
 build a reminder, and with `/ai` enabled the message plus the necessary context
-goes to OpenRouter. Telegram sees messages as the transport. The bot tells users
-the same thing through `/privacy`. If you operate a shared instance, its privacy
+goes to OpenRouter — for a voice message, the recorded audio goes there too, to
+be transcribed. Audio is streamed straight through and never written to disk.
+Telegram sees messages as the transport. The bot tells users the same thing
+through `/privacy`. If you operate a shared instance, its privacy
 policy, key handling, backups and legal compliance are yours to own.
 
 ## Troubleshooting
@@ -341,6 +349,12 @@ the extra local or Docker instance.
 
 **`/ai` does not answer.** Check `OPENROUTER_API_KEY`, your account balance and
 the availability of the selected model. Nothing else depends on OpenRouter.
+
+**A voice message gets no reply.** The assistant has to be on first — send
+`/ai`, then record again. If a step from `/add`, `/task`, `/edit` or
+`/settings` is still open, the bot says so instead: finish it or `/cancel`.
+Notes above 2 MB are refused, and transcription needs the same OpenRouter key
+as typed requests.
 
 **Time zones are not found on Windows.** Install dependencies from
 `requirements.txt`: `tzdata` is pinned there explicitly.

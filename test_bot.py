@@ -73,6 +73,9 @@ from ai_handler import (
     _model_content, _last_tool_user_message, _format_ai_display_text,
     _aggregate_modify_tool_results,
     _ACTION_INTENT_RE, execute_create_task, execute_function,
+    transcribe_audio, voice_audio_format, MAX_VOICE_FILE_BYTES,
+    OPENROUTER_TRANSCRIBE_URL, OPENROUTER_STT_MODEL,
+    OPENROUTER_STT_TIMEOUT_SECONDS, REPLY_LANGUAGE_CONTEXT,
 )
 import config
 from tz_rollback import save_tz_change_snapshot, restore_tz_change, has_tz_rollback, get_tz_rollback_info
@@ -2549,7 +2552,7 @@ def test_ai_mode_toggle_and_routing():
             assert bad not in src, f"leftover one-shot copy in bot.py: {bad!r}"
         assert "describe the payment or task in free form" not in src
         # Empty /list + complex plan editor + dialog 6/6 footer use toggle wording
-        assert "turn on the AI assistant, then just describe it" in src
+        assert "Or /ai to turn on the assistant, then write as in a normal chat." in src
         assert "Turn on the AI assistant (/ai)" in src
         assert "Your next message starts a fresh context" in src
         assert "remind me about ID" in src and "/ai remind me about ID" not in src
@@ -2880,11 +2883,610 @@ def test_recur_anchor():
         db.close()
 
 
+# =============================================================================
+# Voice notes -> speech-to-text -> AI-mode free text
+# =============================================================================
+
+class _FakeSTTResponse:
+    """Minimal httpx-like response. Tests mock only this HTTP boundary."""
+
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text if text else ("" if payload is None else str(payload))
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class _FakeSTTClient:
+    def __init__(self):
+        self.calls = []
+        self.is_closed = False
+        self.response = _FakeSTTResponse(200, {"text": "netflix 999"})
+        self.side_effect = None
+        self.hang_seconds = 0
+
+    async def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.hang_seconds:
+            await asyncio.sleep(self.hang_seconds)
+        if self.side_effect is not None:
+            raise self.side_effect
+        return self.response
+
+
+def _stt_posted_model(kwargs: dict):
+    """Model string from the multipart form or the JSON body, whichever the
+    shipped call uses."""
+    data = kwargs.get("data") or {}
+    if isinstance(data, dict) and data.get("model"):
+        return data["model"]
+    body = kwargs.get("json") or {}
+    if isinstance(body, dict) and body.get("model"):
+        return body["model"]
+    return None
+
+
+def _stt_auth_header(kwargs: dict):
+    headers = kwargs.get("headers") or {}
+    return headers.get("Authorization") or headers.get("authorization")
+
+
+def test_voice_transcription_http_contract():
+    """Shipped transcribe_audio: the /audio/transcriptions contract.
+
+    Mocks only client.post (the HTTP boundary). Asserts the URL, the model,
+    the Bearer header, a 200 transcript, and the typed empty/non-200/exception
+    failures, plus the shared client + semaphore and wait_for (not
+    asyncio.timeout, which needs Python 3.11).
+    """
+    print("\nTesting speech-to-text HTTP contract...")
+    import inspect
+    import ai_handler as ah
+
+    try:
+        assert OPENROUTER_TRANSCRIBE_URL.endswith("/audio/transcriptions")
+        assert OPENROUTER_STT_MODEL
+        assert OPENROUTER_STT_TIMEOUT_SECONDS > 0
+        assert MAX_VOICE_FILE_BYTES >= 256 * 1024
+        assert voice_audio_format("audio/ogg") == "ogg"
+        assert voice_audio_format(None) == "ogg"
+        assert voice_audio_format("audio/mpeg") == "mp3"
+        assert voice_audio_format("audio/ogg; codecs=opus") == "ogg"
+        assert voice_audio_format("application/nonsense") == "ogg"
+
+        fake = _FakeSTTClient()
+        real_get = ah._get_or_client
+        ah._get_or_client = lambda: fake
+        try:
+            # Empty bytes: no HTTP at all, typed empty failure
+            empty = asyncio.run(transcribe_audio(b"", "ogg"))
+            assert empty.text is None and empty.error == "empty"
+            assert fake.calls == []
+
+            # Happy 200 JSON text
+            fake.response = _FakeSTTResponse(200, {"text": "netflix 999 every month"})
+            ok = asyncio.run(transcribe_audio(b"OggS-fake-opus", "ogg"))
+            assert ok.error is None, ok
+            assert ok.text == "netflix 999 every month"
+            assert len(fake.calls) == 1
+            url, kwargs = fake.calls[0]
+            assert url == OPENROUTER_TRANSCRIBE_URL
+            assert _stt_posted_model(kwargs) == OPENROUTER_STT_MODEL
+            assert _stt_auth_header(kwargs) == f"Bearer {ah.OPENROUTER_API_KEY}"
+            # The multipart filename carries the container, so Opus-in-Ogg from
+            # Telegram is not sniffed as wav.
+            files = kwargs.get("files") or {}
+            file_tuple = files.get("file")
+            assert file_tuple, "multipart must send a file field"
+            assert file_tuple[0].endswith(".ogg"), file_tuple[0]
+            assert file_tuple[1] == b"OggS-fake-opus"
+            # The shared client's default timeout is the shorter chat-round
+            # budget, so this request must state its own.
+            assert kwargs.get("timeout") == OPENROUTER_STT_TIMEOUT_SECONDS
+            print("[OK] STT POST url/model/auth/timeout + 200 transcript")
+
+            # A whitespace-only transcript is a failure, not a silent success
+            fake.calls.clear()
+            fake.response = _FakeSTTResponse(200, {"text": "   \n"})
+            blank = asyncio.run(transcribe_audio(b"OggS-blank", "ogg"))
+            assert blank.text is None and blank.error == "empty"
+            assert fake.calls, "HTTP still happens; empty is the result"
+            print("[OK] blank transcript is a typed failure")
+
+            # Non-200
+            fake.calls.clear()
+            fake.response = _FakeSTTResponse(400, text="bad request")
+            http_err = asyncio.run(transcribe_audio(b"OggS-bad", "ogg"))
+            assert http_err.text is None and http_err.error == "http"
+
+            # Non-JSON body
+            fake.calls.clear()
+            fake.response = _FakeSTTResponse(200, payload=None, text="<html>")
+            not_json = asyncio.run(transcribe_audio(b"OggS-html", "ogg"))
+            assert not_json.text is None and not_json.error == "http"
+            print("[OK] non-200 and non-JSON are typed http failures")
+
+            # Transport exception
+            fake.calls.clear()
+            fake.side_effect = RuntimeError("network down")
+            exc = asyncio.run(transcribe_audio(b"OggS-exc", "ogg"))
+            assert exc.text is None and exc.error == "exception"
+            fake.side_effect = None
+            print("[OK] transport exception is a typed failure")
+
+            # wait_for actually bounds a hung POST
+            fake.calls.clear()
+            saved_timeout = ah.OPENROUTER_STT_TIMEOUT_SECONDS
+            ah.OPENROUTER_STT_TIMEOUT_SECONDS = 0.05
+            fake.hang_seconds = 1.0
+            try:
+                hung = asyncio.run(transcribe_audio(b"OggS-hang", "ogg"))
+            finally:
+                ah.OPENROUTER_STT_TIMEOUT_SECONDS = saved_timeout
+                fake.hang_seconds = 0
+            assert hung.text is None and hung.error == "timeout"
+            print("[OK] a hung STT call is bounded by asyncio.wait_for")
+        finally:
+            ah._get_or_client = real_get
+
+        stt_src = inspect.getsource(ah.transcribe_audio)
+        assert "_get_or_client" in stt_src
+        assert "_OR_SEMAPHORE" in stt_src
+        assert "asyncio.wait_for" in stt_src
+        # Call form only - the docstring names asyncio.timeout as the 3.11 API
+        # this project deliberately does not use.
+        assert "asyncio.timeout(" not in stt_src
+        assert "time.sleep(" not in stt_src
+        assert "requests." not in stt_src
+        chat_src = inspect.getsource(ah._post_openrouter)
+        assert "_get_or_client" in chat_src and "_OR_SEMAPHORE" in chat_src
+        print("[OK] STT reuses the shared client + semaphore")
+    except Exception as e:
+        print(f"[ERROR] STT HTTP contract test failed: {e}")
+
+
+def test_voice_ai_handler_routing():
+    """Voice handler: the same AI-mode / conversation / rate-limit gates as
+    typed text; transcription only after those gates; the transcript feeds
+    run_ai_from_message.
+
+    Mocks Telegram's get_file and the STT client. Drives the shipped
+    voice_ai_handler and transcribe_audio, not copies.
+    """
+    print("\nTesting voice handler routing + rate-limit-before-transcription...")
+    init_db()
+    migrate_db()
+    db = SessionLocal()
+    user_id = 990_101
+    import inspect
+    import time as _time
+    import bot as bot_mod
+    import ai_handler as ah
+    from collections import deque as _deque
+
+    class _Voice:
+        def __init__(self, file_size=2048):
+            self.file_id = "AwVOICEFAKE"
+            self.file_size = file_size
+            self.mime_type = "audio/ogg"
+            self.duration = 2
+
+    class _Chat:
+        async def send_action(self, action=None, **kwargs):
+            return None
+
+    class _Msg:
+        def __init__(self, file_size=2048):
+            self.voice = _Voice(file_size=file_size)
+            self.text = None
+            self.document = None
+            self.reply_to_message = None
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    class _Upd:
+        def __init__(self, file_size=2048):
+            self.message = _Msg(file_size=file_size)
+            self.effective_user = type("U", (), {"id": user_id})()
+            self.effective_chat = _Chat()
+
+    class _TgFile:
+        async def download_as_bytearray(self):
+            downloads.append(1)
+            return bytearray(b"OggS-voice-bytes")
+
+    class _Bot:
+        async def get_file(self, file_id):
+            get_file_ids.append(file_id)
+            return _TgFile()
+
+    class _Ctx:
+        def __init__(self):
+            self.bot = _Bot()
+            self.application = None
+
+    get_file_ids = []
+    downloads = []
+    ai_calls = {"n": 0, "texts": [], "kwargs": []}
+
+    async def _fake_run(update, context, user_text, already_rate_limited=False, **kwargs):
+        ai_calls["n"] += 1
+        ai_calls["texts"].append(user_text)
+        ai_calls["kwargs"].append({"already_rate_limited": already_rate_limited, **kwargs})
+
+    fake_client = _FakeSTTClient()
+
+    real_run = bot_mod.run_ai_from_message
+    real_in_conv = bot_mod._user_in_active_conversation
+    real_get_client = ah._get_or_client
+    saved_times = {k: _deque(v) for k, v in bot_mod._ai_call_times.items()}
+
+    def _reset_quota():
+        bot_mod._ai_call_times.pop(user_id, None)
+
+    try:
+        existing = db.query(User).filter(User.id == user_id).first()
+        if existing:
+            db.delete(existing)
+            db.commit()
+        db.add(User(id=user_id))
+        db.commit()
+
+        bot_mod.run_ai_from_message = _fake_run
+        # bot.transcribe_audio is the same function object; it looks
+        # _get_or_client up on the ai_handler module, which is patched here.
+        ah._get_or_client = lambda: fake_client
+
+        # --- AI OFF: no download, no transcription, no AI entry ---
+        update_user_ai_mode(db, user_id, False)
+        db.commit()
+        bot_mod._user_in_active_conversation = lambda update: False
+        _reset_quota()
+        asyncio.run(bot_mod.voice_ai_handler(_Upd(), _Ctx()))
+        assert get_file_ids == [], "AI OFF must not download a voice note"
+        assert fake_client.calls == [], "AI OFF must not transcribe"
+        assert ai_calls["n"] == 0, "AI OFF must not call run_ai_from_message"
+        print("[OK] AI OFF ignores a voice note")
+
+        # --- Mid conversation, AI ON: a notice, no transcription ---
+        update_user_ai_mode(db, user_id, True)
+        db.commit()
+        bot_mod._user_in_active_conversation = lambda update: True
+        blocked = _Upd()
+        asyncio.run(bot_mod.voice_ai_handler(blocked, _Ctx()))
+        assert get_file_ids == []
+        assert fake_client.calls == []
+        assert ai_calls["n"] == 0
+        assert blocked.message.replies, "mid-conversation voice must not go silent"
+        assert "/cancel" in blocked.message.replies[0]
+        print("[OK] mid-conversation voice blocked with a /cancel notice")
+
+        # --- Per-minute quota is charged BEFORE transcription ---
+        bot_mod._user_in_active_conversation = lambda update: False
+        _reset_quota()
+        now = _time.monotonic()
+        bot_mod._ai_call_times[user_id] = _deque([now] * bot_mod.AI_RATE_LIMIT_PER_MINUTE)
+        limited = _Upd()
+        asyncio.run(bot_mod.voice_ai_handler(limited, _Ctx()))
+        assert get_file_ids == [], "over-quota must not getFile"
+        assert fake_client.calls == [], "over-quota must not transcribe"
+        assert ai_calls["n"] == 0
+        assert limited.message.replies
+        assert "wait a minute" in limited.message.replies[0].lower()
+        print("[OK] the per-minute quota blocks transcription")
+
+        # --- Per-day quota ---
+        _reset_quota()
+        bot_mod._ai_call_times[user_id] = _deque(
+            [_time.monotonic() - 120] * bot_mod.AI_RATE_LIMIT_PER_DAY
+        )
+        day_hit = _Upd()
+        asyncio.run(bot_mod.voice_ai_handler(day_hit, _Ctx()))
+        assert get_file_ids == []
+        assert fake_client.calls == []
+        assert ai_calls["n"] == 0
+        assert day_hit.message.replies
+        assert "daily ai limit" in day_hit.message.replies[0].lower()
+        print("[OK] the per-day quota blocks transcription")
+
+        # --- Size cap is enforced before the download ---
+        _reset_quota()
+        huge = _Upd(file_size=MAX_VOICE_FILE_BYTES + 1)
+        asyncio.run(bot_mod.voice_ai_handler(huge, _Ctx()))
+        assert get_file_ids == []
+        assert fake_client.calls == []
+        assert ai_calls["n"] == 0
+        assert huge.message.replies
+        assert "too large" in huge.message.replies[0].lower()
+        print("[OK] an oversized voice note is rejected before getFile")
+
+        # --- Happy path: the transcript is passed through verbatim ---
+        _reset_quota()
+        fake_client.calls.clear()
+        fake_client.response = _FakeSTTResponse(200, {"text": "netflix 999 every month"})
+        happy = _Upd()
+        asyncio.run(bot_mod.voice_ai_handler(happy, _Ctx()))
+        assert get_file_ids == ["AwVOICEFAKE"], get_file_ids
+        assert downloads == [1]
+        assert fake_client.calls, "the happy path must actually transcribe"
+        url, kwargs = fake_client.calls[-1]
+        assert url == OPENROUTER_TRANSCRIBE_URL
+        assert _stt_posted_model(kwargs) == OPENROUTER_STT_MODEL
+        assert _stt_auth_header(kwargs) == f"Bearer {ah.OPENROUTER_API_KEY}"
+        assert ai_calls["n"] == 1, ai_calls
+        assert ai_calls["texts"][-1] == "netflix 999 every month"
+        assert ai_calls["kwargs"][-1]["already_rate_limited"] is True
+        print("[OK] AI ON idle voice transcribes and enters run_ai_from_message")
+
+        # --- An empty transcript is an error, not an AI call ---
+        _reset_quota()
+        fake_client.calls.clear()
+        fake_client.response = _FakeSTTResponse(200, {"text": ""})
+        before = ai_calls["n"]
+        empty_upd = _Upd()
+        asyncio.run(bot_mod.voice_ai_handler(empty_upd, _Ctx()))
+        assert ai_calls["n"] == before
+        assert empty_upd.message.replies
+        assert "no speech" in empty_upd.message.replies[0].lower()
+        print("[OK] an empty transcript does not call run_ai_from_message")
+
+        # --- An STT HTTP error is an error, not an AI call ---
+        _reset_quota()
+        fake_client.response = _FakeSTTResponse(400, text="nope")
+        err_upd = _Upd()
+        asyncio.run(bot_mod.voice_ai_handler(err_upd, _Ctx()))
+        assert ai_calls["n"] == before
+        assert err_upd.message.replies
+        assert "transcribe" in err_upd.message.replies[0].lower()
+        print("[OK] an STT HTTP error does not call run_ai_from_message")
+
+        # --- Double-charge guard: at 4/5 used, a voice note must still run ---
+        bot_mod.run_ai_from_message = real_run
+        or_calls = []
+
+        async def _fake_or(user_message, uid, intent_text=None):
+            or_calls.append(intent_text)
+            return {
+                "success": True,
+                "message": "ok",
+                "dialog_count": 1,
+                "expense_ids": [],
+                "cleanup": [],
+            }
+
+        async def _fake_postproc(app, result):
+            return
+
+        real_or = bot_mod.call_openrouter
+        real_postproc = bot_mod._run_ai_post_processing
+        bot_mod.call_openrouter = _fake_or
+        bot_mod._run_ai_post_processing = _fake_postproc
+        fake_client.response = _FakeSTTResponse(200, {"text": "task doctor tomorrow"})
+        fake_client.calls.clear()
+        try:
+            _reset_quota()
+            bot_mod._ai_call_times[user_id] = _deque(
+                [_time.monotonic()] * (bot_mod.AI_RATE_LIMIT_PER_MINUTE - 1)
+            )
+            quota_upd = _Upd()
+            asyncio.run(bot_mod.voice_ai_handler(quota_upd, _Ctx()))
+            assert or_calls == ["task doctor tomorrow"], (
+                "at 4/5 quota a voice note must still enter call_openrouter once; "
+                "charging the rate limit twice would block the chat path"
+            )
+            assert not any("wait a minute" in r.lower() for r in quota_upd.message.replies)
+            print("[OK] the voice rate limit is charged once, before transcription")
+        finally:
+            bot_mod.call_openrouter = real_or
+            bot_mod._run_ai_post_processing = real_postproc
+
+        # --- Structural: registration, order, no blocking calls ---
+        src_path = os.path.join(os.path.dirname(__file__), "bot.py")
+        bot_src = open(src_path, encoding="utf-8").read()
+        assert "voice_ai_handler" in bot_src
+        assert "MessageHandler(filters.VOICE, voice_ai_handler)" in bot_src
+        idx_conv_settings = bot_src.find("application.add_handler(conv_settings)")
+        idx_voice = bot_src.find("MessageHandler(filters.VOICE, voice_ai_handler)")
+        assert idx_conv_settings > 0 and idx_voice > idx_conv_settings
+        idx_free = bot_src.find(
+            "MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_ai_handler)"
+        )
+        assert idx_voice > idx_free, "the voice handler sits with free text, after conversations"
+        handler_src = inspect.getsource(bot_mod.voice_ai_handler)
+        assert handler_src.find("_ai_rate_limit_check") < handler_src.find("get_file")
+        assert handler_src.find("_ai_rate_limit_check") < handler_src.find("transcribe_audio")
+        assert "already_rate_limited=True" in handler_src
+        assert "time.sleep" not in handler_src
+        assert "requests." not in handler_src
+        assert bot_mod.transcribe_audio is ah.transcribe_audio
+        print("[OK] main() registers filters.VOICE after the ConversationHandlers")
+    except Exception as e:
+        print(f"[ERROR] voice handler routing test failed: {e}")
+        db.rollback()
+    finally:
+        bot_mod.run_ai_from_message = real_run
+        bot_mod._user_in_active_conversation = real_in_conv
+        ah._get_or_client = real_get_client
+        bot_mod._ai_call_times.clear()
+        bot_mod._ai_call_times.update(saved_times)
+        db.close()
+
+
+def test_reply_language_pinned_to_interface():
+    """Every AI call restates the interface language.
+
+    The static prompt already asks for English, but the input can arrive in
+    another language - a forward, a quote, or a transcribed voice note - and
+    models mirror their input. The live block is what keeps the reply in the
+    bot's own language, so it must be attached to the system content of every
+    call, not only mentioned in the prompt.
+    """
+    print("\nTesting the reply-language block...")
+    import inspect
+    import ai_handler as ah
+
+    try:
+        assert "USER INTERFACE LANGUAGE" in REPLY_LANGUAGE_CONTEXT
+        assert "English" in REPLY_LANGUAGE_CONTEXT
+        low = REPLY_LANGUAGE_CONTEXT.lower()
+        assert "voice transcript" in low, "the voice case must be named explicitly"
+        assert "forwarded" in low
+        assert "do not switch" in low
+
+        call_src = inspect.getsource(ah.call_openrouter)
+        assert "REPLY_LANGUAGE_CONTEXT" in call_src, (
+            "the block must be appended to system_content on every call"
+        )
+        # It rides next to the other live per-call state, not inside the static prompt.
+        assert "REPLY_LANGUAGE_CONTEXT" not in ah.SYSTEM_PROMPT
+        assert "time_context + REPLY_LANGUAGE_CONTEXT" in call_src
+        assert "Responses must be in English" in ah.SYSTEM_PROMPT, (
+            "the static instruction stays as the fallback"
+        )
+        print("[OK] the interface language is restated on every AI call")
+    except Exception as e:
+        print(f"[ERROR] reply-language test failed: {e}")
+
+
+def test_settings_command_reentry():
+    """A second /settings while the menu is still open must be accepted.
+
+    /settings is a ConversationHandler whose waiting state only matches inline
+    callbacks, and the menu stays in that state until a completing tap or
+    /cancel. With PTB's default allow_reentry=False every later /settings is
+    dropped in silence - the usual "let me open it again" path.
+    """
+    print("\nTesting /settings reentry while the menu is still open...")
+    import warnings as _warnings
+    from datetime import datetime as _dt, timezone as _tz
+    from telegram import (
+        Update as _Update, Message as _Message, User as _TGUser,
+        Chat as _TGChat, MessageEntity as _ME,
+    )
+    from telegram.ext import (
+        ConversationHandler as _CH, CommandHandler as _Cmd,
+        CallbackQueryHandler as _CQ, MessageHandler as _MH, filters as _filters,
+    )
+    import bot as bot_module
+
+    def _make_conv(allow_reentry: bool):
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            return _CH(
+                entry_points=[_Cmd("settings", bot_module.settings_command)],
+                states={
+                    bot_module.SETTINGS_MENU: [_CQ(
+                        bot_module.settings_callback, pattern="^(settings_|tzsel_|currsel_)",
+                    )],
+                    bot_module.SETTINGS_TZ_SEARCH: [_MH(
+                        _filters.TEXT & ~_filters.COMMAND, bot_module.settings_tz_search,
+                    )],
+                },
+                fallbacks=[_Cmd("cancel", bot_module.cancel)],
+                allow_reentry=allow_reentry,
+            )
+
+    class _DummyBot:
+        username = "testbot"
+        defaults = None
+
+    user_id = 990_010
+    sent = []
+    db = SessionLocal()
+    try:
+        tg_user = _TGUser(id=42, first_name="T", is_bot=False)
+        chat = _TGChat(id=42, type="private")
+        entity = _ME(type=_ME.BOT_COMMAND, offset=0, length=len("/settings"))
+        message = _Message(
+            message_id=1,
+            date=_dt.now(_tz.utc),
+            chat=chat,
+            from_user=tg_user,
+            text="/settings",
+            entities=(entity,),
+        )
+        dummy = _DummyBot()
+        message.set_bot(dummy)
+        update = _Update(update_id=1, message=message)
+        update.set_bot(dummy)
+        key = (chat.id, tg_user.id)
+
+        stuck = _make_conv(allow_reentry=False)
+        stuck._conversations[key] = bot_module.SETTINGS_MENU
+        assert stuck.check_update(update) is None, (
+            "without allow_reentry a second /settings must be the silent drop"
+        )
+
+        fixed = _make_conv(allow_reentry=True)
+        fixed._conversations[key] = bot_module.SETTINGS_MENU
+        check = fixed.check_update(update)
+        assert check is not None, "allow_reentry=True must accept a second /settings"
+        _state, _key, handler, _inner = check
+        assert handler.commands == {"settings"}, handler.commands
+
+        # The shipped registration must actually carry the flag.
+        src_path = os.path.join(os.path.dirname(__file__), "bot.py")
+        bot_src = open(src_path, encoding="utf-8").read()
+        conv_chunk = bot_src[
+            bot_src.find("conv_settings = ConversationHandler("):
+            bot_src.find("application.add_handler(conv_settings)")
+        ]
+        assert conv_chunk, "conv_settings registration not found"
+        assert "allow_reentry=True" in conv_chunk, (
+            "the shipped /settings conversation must set allow_reentry"
+        )
+
+        # A first open must still render (a crash here would look identical to
+        # the silent drop above).
+        init_db()
+        migrate_db()
+        db.query(User).filter(User.id == user_id).delete()
+        db.commit()
+        db.add(User(id=user_id))
+        db.commit()
+
+        class _Msg:
+            async def reply_text(self, text, **kwargs):
+                sent.append(text)
+
+        class _Open:
+            def __init__(self):
+                self.effective_user = type("U", (), {"id": user_id})()
+                self.message = _Msg()
+                self.callback_query = None
+
+        result = asyncio.run(bot_module.settings_command(_Open(), None))
+        assert result == bot_module.SETTINGS_MENU, result
+        assert sent and "Settings" in sent[-1], sent
+        print("[OK] a second /settings re-enters; the first open still renders")
+    except Exception as e:
+        print(f"[ERROR] /settings reentry: {e}")
+        db.rollback()
+    finally:
+        try:
+            db.rollback()
+            db.query(User).filter(User.id == user_id).delete()
+            db.commit()
+        except Exception:
+            db.rollback()
+        db.close()
+
+
 TESTS = [
     test_database,
     test_ai_multiline_title_note,
     test_ai_mode_toggle_and_routing,
     test_ai_on_slash_commands_isolated_from_free_text,
+    test_voice_transcription_http_contract,
+    test_voice_ai_handler_routing,
+    test_reply_language_pinned_to_interface,
+    test_settings_command_reentry,
     test_bot_command_menu,
     test_user_seq_per_user,
     test_scheduler_logic,

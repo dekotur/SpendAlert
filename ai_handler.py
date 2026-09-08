@@ -15,6 +15,7 @@ except ImportError:
     pass
 
 from datetime import datetime
+from typing import NamedTuple
 from database import (
     Expense, User, AISession, get_db, get_user_timezone,
     get_user_default_currency, add_expense, get_expense_by_user_seq, utcnow_naive,
@@ -223,6 +224,21 @@ Formatting rules for Telegram (use ONLY HTML, NOT Markdown):
 
 IMPORTANT: Your final response to user must use HTML formatting (<b>, <i>, <code>), NOT Markdown (** * _)."""
 
+# Appended to every call, next to CURRENT DATE AND TIME. The static prompt
+# above already asks for English, but one instruction buried in a long prompt
+# is not enough once the input itself can arrive in another language: a
+# forwarded receipt, a quoted message, or - since voice notes are transcribed
+# and fed in as ordinary text - a voice message spoken in another language.
+# Models tend to mirror the language of their input, so the interface language
+# is restated as its own explicit block.
+REPLY_LANGUAGE_CONTEXT = (
+    "\n\n"
+    "USER INTERFACE LANGUAGE: English (en)\n"
+    "Always reply to the user in English. This is the bot's interface "
+    "language. Do not switch to match the language of the current message, "
+    "a forwarded text, or a voice transcript."
+)
+
 # OpenRouter is optional, but its key must come from the environment. There is
 # deliberately no hard-coded fallback.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -249,6 +265,49 @@ OPENROUTER_CALL_BUDGET_SECONDS = 45
 OPENROUTER_ROUND_TIMEOUT_SECONDS = 20
 _OR_SEMAPHORE = asyncio.Semaphore(25)
 _or_client: httpx.AsyncClient | None = None
+
+# Speech-to-text for Telegram voice notes (see bot.voice_ai_handler). Same
+# provider and API key as the chat completions above, different endpoint.
+OPENROUTER_TRANSCRIBE_URL = os.getenv(
+    "OPENROUTER_TRANSCRIBE_URL",
+    "https://openrouter.ai/api/v1/audio/transcriptions",
+)
+OPENROUTER_STT_MODEL = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-large-v3-turbo")
+# Whisper-turbo is typically sub-second on a voice note; 30s bounds a hung
+# provider. This is deliberately longer than OPENROUTER_ROUND_TIMEOUT_SECONDS
+# (the shared client's default), so the STT request passes it explicitly.
+OPENROUTER_STT_TIMEOUT_SECONDS = 30
+# Checked against Telegram Voice.file_size *before* the file is downloaded.
+# Real voice notes are tens to hundreds of KB; 2 MB is generous headroom and
+# well under the provider's own multipart cap.
+MAX_VOICE_FILE_BYTES = 2 * 1024 * 1024
+
+# Telegram sends Opus-in-Ogg; the rest are accepted so audio from a
+# non-standard client still transcribes instead of being rejected.
+_STT_MIME_TO_FORMAT = {
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/webm": "webm",
+}
+
+
+class TranscriptionResult(NamedTuple):
+    """Typed STT outcome. error is None on success; otherwise a code:
+    empty | http | timeout | exception. text is set only on success."""
+    text: str | None
+    error: str | None
+
+
+def voice_audio_format(mime_type: str | None) -> str:
+    """Map a Telegram Voice.mime_type to an STT format token."""
+    if not mime_type:
+        return "ogg"
+    key = mime_type.split(";", 1)[0].strip().lower()
+    return _STT_MIME_TO_FORMAT.get(key, "ogg")
 
 # AI dialog: 6 user turns + assistant replies; reset after 6/6 or 10 min idle
 MAX_DIALOG_TURNS = 6
@@ -525,6 +584,90 @@ async def _post_openrouter(payload: dict, headers: dict) -> httpx.Response:
     return response
 
 
+async def transcribe_audio(
+    audio_bytes: bytes,
+    audio_format: str = "ogg",
+) -> TranscriptionResult:
+    """Speech-to-text via OpenRouter Whisper. Shared httpx client + semaphore.
+
+    POSTs bytes to /api/v1/audio/transcriptions (not chat/completions), so the
+    body is multipart with a file field rather than JSON. Never raises: a voice
+    note that cannot be transcribed becomes an error code the caller turns into
+    a message, not a traceback out of a handler.
+
+    The timeout uses asyncio.wait_for rather than asyncio.timeout, which needs
+    Python 3.11 - this project still supports 3.10 (see the CI matrix).
+    """
+    if not audio_bytes:
+        return TranscriptionResult(text=None, error="empty")
+
+    fmt = (audio_format or "ogg").strip().lower() or "ogg"
+    mime = {
+        "ogg": "audio/ogg",
+        "wav": "audio/wav",
+        "mp3": "audio/mpeg",
+        "webm": "audio/webm",
+    }.get(fmt, "application/octet-stream")
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+    data = {"model": OPENROUTER_STT_MODEL}
+    client = _get_or_client()
+
+    async def _post_once() -> httpx.Response:
+        # Rebuild the files mapping on every attempt: httpx may consume a
+        # file-like body on the first POST, and a retry would then send an
+        # empty one. The filename carries the container so Opus-in-Ogg from
+        # Telegram is not sniffed as wav. The shared client's default timeout
+        # is the per-round chat budget, which is shorter than STT needs, so
+        # this request states its own.
+        files = {"file": (f"voice.{fmt}", audio_bytes, mime)}
+        async with _OR_SEMAPHORE:
+            return await client.post(
+                OPENROUTER_TRANSCRIBE_URL,
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=OPENROUTER_STT_TIMEOUT_SECONDS,
+            )
+
+    async def _post_with_retry() -> httpx.Response:
+        response = await _post_once()
+        if response.status_code in (429, 500, 502, 503):
+            await asyncio.sleep(1.5)
+            response = await _post_once()
+        return response
+
+    try:
+        response = await asyncio.wait_for(
+            _post_with_retry(),
+            timeout=OPENROUTER_STT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("OpenRouter STT timed out after %ss", OPENROUTER_STT_TIMEOUT_SECONDS)
+        return TranscriptionResult(text=None, error="timeout")
+    except Exception:
+        logger.exception("OpenRouter STT request failed")
+        return TranscriptionResult(text=None, error="exception")
+
+    if response.status_code != 200:
+        logger.error(
+            "OpenRouter STT error: %s - %s",
+            response.status_code,
+            (response.text or "")[:300],
+        )
+        return TranscriptionResult(text=None, error="http")
+
+    try:
+        payload = response.json()
+        text = (payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+    except Exception:
+        logger.warning("OpenRouter STT returned a non-JSON body")
+        return TranscriptionResult(text=None, error="http")
+
+    if not text:
+        return TranscriptionResult(text=None, error="empty")
+    return TranscriptionResult(text=text, error=None)
+
+
 async def call_openrouter(user_message, user_id, intent_text: str | None = None):
     """Call OpenRouter API with function calling loop (up to 5 rounds).
     Dialog context: up to 6 user turns + replies; resets after 6/6 or 10 min idle.
@@ -552,7 +695,7 @@ async def call_openrouter(user_message, user_id, intent_text: str | None = None)
             f"- Weekday number (0=Mon ... 6=Sun): {now.weekday()}\n"
             f"Always use this date as \"today\" when computing due dates and parsing relative dates."
         )
-        system_content = SYSTEM_PROMPT + time_context
+        system_content = SYSTEM_PROMPT + time_context + REPLY_LANGUAGE_CONTEXT
 
         is_dialog_start = turn_count == 0
         if is_dialog_start:

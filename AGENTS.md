@@ -35,14 +35,14 @@ follow `SECURITY.md`; deleting the latest line is not enough.
 | `scheduler.py` | APScheduler jobs and Telegram reminder delivery |
 | `reminder_plan.py` | Pure reminder-plan model and validation |
 | `reminder_engine.py` | Reminder episode calculation and persisted schedule state |
-| `ai_handler.py` | Optional OpenRouter tool loop and user-scoped AI context |
+| `ai_handler.py` | Optional OpenRouter tool loop, voice transcription, and user-scoped AI context |
 | `ics_import.py` | Bounded `.ics` parsing and event conversion |
 | `currency.py` | Exchange-rate cache and currency conversion |
 | `utils.py` | Dates, time zones, message context, recurrence helpers |
 | `tz_rollback.py` | Time-zone change snapshots and rollback |
 | `monitoring.py` | Optional Telegram alerts for lock and disk conditions |
 | `config.py` | Environment contract, portable state paths, logging |
-| `test_bot.py` | Self-contained 52-group regression suite |
+| `test_bot.py` | Self-contained 56-group regression suite |
 | `scripts/security_audit.py` | Publication-content secret and local-data guard |
 | `scripts/generate_key.py` | Prints a fresh Fernet key for `DB_ENCRYPTION_KEY` |
 | `docs/reminder-plan.md` | Reminder-plan design contract; code comments cite its section numbers |
@@ -85,7 +85,7 @@ python -m compileall -q .
 Expected test marker:
 
 ```text
-[SUCCESS] All 52 test groups passed
+[SUCCESS] All 56 test groups passed
 ```
 
 Do not create `.env` merely to run tests. Do not reuse a developer's existing
@@ -107,6 +107,8 @@ Required variables:
 Optional variables:
 
 - `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, `OPENROUTER_URL` — AI mode;
+- `OPENROUTER_STT_MODEL`, `OPENROUTER_TRANSCRIBE_URL` — voice transcription,
+  which reuses `OPENROUTER_API_KEY`;
 - `ADMIN_CHAT_ID` — operational alerts;
 - `SPENDALERT_DATA_DIR` — external runtime-state directory;
 - `DATABASE_URL` — SQLite URL override;
@@ -163,6 +165,22 @@ unless the user explicitly wants to delete the persisted database volume.
    must retain the `/privacy` disclosure.
 10. Tests must point `DATABASE_URL` at a disposable file before importing
     `database.py`; never test against a local or live database.
+11. A voice message is only an input format, never a second set of rules:
+    `voice_ai_handler` applies the same AI-mode and active-conversation
+    gates as typed text, charges the per-user rate limit *before* any audio
+    is fetched or transcribed, and passes `already_rate_limited=True` so the
+    same call is not charged twice. Keep the size cap checked against the
+    reported `file_size` before the download; stream audio through and never
+    persist or log it.
+12. Every AI call appends `REPLY_LANGUAGE_CONTEXT` to the system content.
+    The static prompt's language line is only the fallback: a forwarded
+    message, a quote, or a transcribed voice note can arrive in another
+    language, and without the live block the model answers in that language
+    instead of the bot's interface language.
+13. Keep `allow_reentry=True` on the `/settings` conversation. Its waiting
+    state matches inline callbacks only, so without the flag a second
+    `/settings` while the menu is open matches neither the state handlers nor
+    `/cancel`, and PTB drops it in silence.
 
 ## Change workflow
 
@@ -191,7 +209,7 @@ committing unexpected files. Keep runtime artifacts ignored and out of Git.
 A change is ready only when:
 
 - its requested behavior is implemented and covered by evidence;
-- all 52 test groups pass with an honest process exit code;
+- all 56 test groups pass with an honest process exit code;
 - `ruff check .`, source compilation and `scripts/security_audit.py` pass;
 - README, `.env.example`, privacy text, and agent instructions remain accurate;
 - no real secret, local-machine fingerprint, private infrastructure reference,

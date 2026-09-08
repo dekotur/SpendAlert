@@ -48,7 +48,10 @@ from currency import (
     get_exchange_rates, currency_symbol, currency_label,
     SETTINGS_CURRENCIES, convert_amount,
 )
-from ai_handler import call_openrouter, backup_database
+from ai_handler import (
+    call_openrouter, backup_database,
+    transcribe_audio, voice_audio_format, MAX_VOICE_FILE_BYTES,
+)
 import ics_import
 import monitoring
 from tz_rollback import (
@@ -108,12 +111,17 @@ PRIVACY_AI_LINE = (
     "are sent to an external AI service."
 )
 
-# User-facing help — /ai is permanent assistant ON/OFF; free text when ON.
+# User-facing help — /ai is permanent assistant ON/OFF; free text (and voice
+# notes) when ON. Plain language on purpose: this is most readers' first
+# contact, so it says "write as in a normal chat" rather than naming internal
+# concepts like free text or a toggle. The assistant is off until the reader
+# turns it on (users.ai_mode defaults to False), so every "just write" line
+# stays attached to the /ai that enables it.
 HELP_TEXT = (
     "📖 <b>Help</b>\n\n"
     "I remind you about payments and tasks.\n\n"
-    "<b>AI assistant</b> - /ai turns it on and off.\n"
-    "While it is <b>on</b>, type plain text (no command):\n"
+    "<b>AI assistant</b> - /ai turns it on or off. It starts off.\n"
+    "While it is <b>on</b>, write as in a normal chat. For example:\n"
     "<code>netflix 999 every month</code>\n"
     "<code>task doctor tomorrow</code>\n"
     "<code>what is coming up</code>\n"
@@ -121,13 +129,14 @@ HELP_TEXT = (
     "<code>move 2 to Friday</code>\n"
     "<code>remind me about 2 a week ahead</code>\n"
     "<code>undo</code>  - roll back the last change\n"
+    "You can send a voice message — I will understand it too.\n"
     "While it is <b>off</b>, only slash commands work.\n\n"
     "<b>Commands</b>\n"
     "/ai - turn the AI assistant on or off\n"
     "/add - a payment, step by step\n"
     "/task - a task, step by step\n"
     "/list - my list\n"
-    "/edit 2 - change a record, including its 🔔 reminders\n"
+    "/edit 2 - change a record, including its reminders\n"
     "/delete 2 - delete a record\n"
     "/settings - time zone, currency, reminder hour, quiet hours, sorting\n"
     "/privacy - data processing\n"
@@ -144,9 +153,10 @@ HELP_TEXT = (
 
 AI_MODE_ON_TEXT = (
     "🤖 <b>AI assistant is on</b>\n\n"
-    "Type what to add, move or look up.\n"
+    "Write as in a normal chat — what to add, move or look up.\n"
+    "You can send a voice message.\n"
     "The /add /task /list /edit /settings commands still work.\n"
-    "While an /add step is open, your text goes to that step, not to the AI.\n\n"
+    "While an /add step is open, your text goes to that step, not to the assistant.\n\n"
     "<b>Examples:</b>\n"
     "<code>netflix 999 every month</code>\n"
     "<code>task bank tomorrow</code>\n"
@@ -158,10 +168,18 @@ AI_MODE_ON_TEXT = (
     f"{PRIVACY_AI_LINE}"
 )
 
+# Shown when text or a voice note arrives while a step with buttons is open
+# (the /settings menu, the reminder-plan editor). Those states match only
+# callbacks, so the message would otherwise be swallowed without a word.
+STEP_STILL_OPEN_TEXT = (
+    "⏳ A /add, /task, /edit or /settings step is still open. "
+    "Finish it or /cancel — then what you send goes to the assistant again."
+)
+
 AI_MODE_OFF_TEXT = (
     "🔇 <b>AI assistant is off</b>\n\n"
     "Commands only now: /add /task /list /edit /delete /settings /help.\n"
-    "Free text is no longer sent to the AI.\n"
+    "Ordinary messages and voice messages are not read.\n"
     "/ai again turns it back on."
 )
 
@@ -725,10 +743,11 @@ async def start(update: Update, context: CallbackContext):
 
     await update.message.reply_text(
         f"👋 <b>{user.first_name}</b>! I remind you about payments and tasks.\n\n"
-        "<b>/ai</b> turns on the AI assistant; after that just type:\n"
+        "<b>/ai</b> turns on the AI assistant. After that, write as in a normal chat:\n"
         "<code>netflix 999 every month</code>\n"
-        "<code>task doctor tomorrow</code>\n\n"
-        "Or step by step: /add for a payment, /task for a task.\n"
+        "<code>task doctor tomorrow</code>\n"
+        "A voice message works too — I will understand it.\n\n"
+        "Or step by step, no assistant needed: /add for a payment, /task for a task.\n"
         "List: /list · Help: /help\n\n"
         "I will send the reminders myself.\n\n"
         f"{PRIVACY_ONBOARD_BLOCK}",
@@ -1728,9 +1747,10 @@ async def list_expenses(update: Update, context: CallbackContext):
     if built_message is None:
         await update.message.reply_text(
             "📭 <b>The list is empty</b>\n\n"
+            "Add one step by step:\n"
             "/add - a payment\n"
             "/task - a task\n"
-            "/ai - turn on the AI assistant, then just describe it",
+            "Or /ai to turn on the assistant, then write as in a normal chat.",
             parse_mode='HTML'
         )
         return
@@ -1845,27 +1865,33 @@ async def run_ai_from_message(
     update: Update,
     context: CallbackContext,
     user_text: str,
+    already_rate_limited: bool = False,
 ) -> None:
     """Shared OpenRouter entry used by free-text AI when permanent mode is ON.
 
     Same rate-limit, privacy first-use, reply/forward/ics context, and
     post-processing as the former one-shot /ai <text> path.
+
+    already_rate_limited: the voice path spends the 5/min 100/day slot *before*
+    transcription, so speech-to-text cannot be used to bypass the cap; skip a
+    second charge here.
     """
     user = update.effective_user
 
-    rate_limit_hit = _ai_rate_limit_check(user.id)
-    if rate_limit_hit == "minute":
-        await update.message.reply_text(
-            "⏳ Rate limit: wait a minute.",
-            parse_mode='HTML',
-        )
-        return
-    if rate_limit_hit == "day":
-        await update.message.reply_text(
-            "⏳ Daily AI limit reached. Try again tomorrow.",
-            parse_mode='HTML',
-        )
-        return
+    if not already_rate_limited:
+        rate_limit_hit = _ai_rate_limit_check(user.id)
+        if rate_limit_hit == "minute":
+            await update.message.reply_text(
+                "⏳ Rate limit: wait a minute.",
+                parse_mode='HTML',
+            )
+            return
+        if rate_limit_hit == "day":
+            await update.message.reply_text(
+                "⏳ Daily AI limit reached. Try again tomorrow.",
+                parse_mode='HTML',
+            )
+            return
 
     user_text = (user_text or "").strip()
     ics_context = await _extract_ics_ai_context(
@@ -1934,10 +1960,129 @@ async def free_text_ai_handler(update: Update, context: CallbackContext):
         in_active_conversation=in_conv,
         is_command=False,
     ):
+        # Callback-only states (the /settings menu, PLAN_EDITOR) never consume
+        # text, so this handler still runs for them. Returning in silence looks
+        # exactly like a dead assistant; say the step is still open instead.
+        if ai_on and in_conv:
+            logger.info(
+                "AI free-text dropped: user %s in active conversation",
+                update.effective_user.id,
+            )
+            try:
+                await update.message.reply_text(
+                    STEP_STILL_OPEN_TEXT,
+                    parse_mode='HTML',
+                )
+            except Exception:
+                pass
         return
 
     user_text = (update.message.text or "").strip()
     await run_ai_from_message(update, context, user_text=user_text)
+
+
+async def voice_ai_handler(update: Update, context: CallbackContext):
+    """Telegram voice note (message.voice) → speech-to-text → the same AI path
+    as typed text.
+
+    The gates match free_text_ai_handler exactly: with the assistant off the
+    note is ignored, and mid /add|/task|/edit|/settings it gets the same
+    "step still open" notice. The rate limit is charged before anything is
+    downloaded or transcribed, so a voice note cannot buy a free AI call. A
+    successful transcript goes through run_ai_from_message and therefore spends
+    one of the dialog's turns, like a typed message.
+    """
+    if not update.message or not update.message.voice or not update.effective_user:
+        return
+    if not await is_registered_user(update.effective_user.id):
+        return
+
+    in_conv = _user_in_active_conversation(update)
+    ai_on = await asyncio.to_thread(_get_ai_mode_sync, update.effective_user.id)
+    if not should_route_free_text_to_ai(
+        ai_mode_on=ai_on,
+        in_active_conversation=in_conv,
+        is_command=False,
+    ):
+        if ai_on and in_conv:
+            logger.info(
+                "AI voice dropped: user %s in active conversation",
+                update.effective_user.id,
+            )
+            try:
+                await update.message.reply_text(
+                    STEP_STILL_OPEN_TEXT,
+                    parse_mode='HTML',
+                )
+            except Exception:
+                pass
+        return
+
+    rate_limit_hit = _ai_rate_limit_check(update.effective_user.id)
+    if rate_limit_hit == "minute":
+        await update.message.reply_text(
+            "⏳ Rate limit: wait a minute.",
+            parse_mode='HTML',
+        )
+        return
+    if rate_limit_hit == "day":
+        await update.message.reply_text(
+            "⏳ Daily AI limit reached. Try again tomorrow.",
+            parse_mode='HTML',
+        )
+        return
+
+    voice = update.message.voice
+    # Telegram reports the size up front, so an oversized note is refused
+    # without downloading it.
+    if voice.file_size and voice.file_size > MAX_VOICE_FILE_BYTES:
+        await update.message.reply_text(
+            "❌ That file is too large.",
+            parse_mode='HTML',
+        )
+        return
+
+    audio_format = voice_audio_format(getattr(voice, "mime_type", None))
+
+    try:
+        async with typing_indicator(update.effective_chat):
+            tg_file = await context.bot.get_file(voice.file_id)
+            data = bytes(await tg_file.download_as_bytearray())
+            # file_size is advisory; check the bytes actually received too.
+            if len(data) > MAX_VOICE_FILE_BYTES:
+                await update.message.reply_text(
+                    "❌ That file is too large.",
+                    parse_mode='HTML',
+                )
+                return
+            stt = await transcribe_audio(data, audio_format)
+    except Exception as e:
+        logger.warning(
+            "Failed to download/transcribe voice from user %s: %s",
+            update.effective_user.id, e,
+        )
+        await update.message.reply_text(
+            "❌ Could not download the voice note.",
+            parse_mode='HTML',
+        )
+        return
+
+    if stt.error or not (stt.text or "").strip():
+        if stt.error == "empty":
+            await update.message.reply_text(
+                "❌ No speech in that voice note — type it or record again.",
+                parse_mode='HTML',
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Could not transcribe the voice note. Try again.",
+                parse_mode='HTML',
+            )
+        return
+
+    await run_ai_from_message(
+        update, context, user_text=stt.text, already_rate_limited=True,
+    )
 
 
 async def handle_ics_document(update: Update, context: CallbackContext):
@@ -2738,7 +2883,7 @@ class _PerChatUpdateProcessor(BaseUpdateProcessor):
 # /test_button are intentionally omitted — /start is the entry link, and
 # /test_button is a dev-only diagnostic.
 BOT_COMMANDS = [
-    ("ai", "Turn the AI assistant on or off (free text)"),
+    ("ai", "Turn the AI assistant on or off"),
     ("add", "Add a payment"),
     ("task", "Add a task"),
     ("list", "List payments and tasks"),
@@ -2751,8 +2896,8 @@ BOT_COMMANDS = [
 ]
 
 BOT_SHORT_DESCRIPTION = (
-    "Reminders for payments and tasks. /ai toggles the AI assistant; "
-    "or add step by step with /add and /task."
+    "Reminders for payments and tasks. With /ai on, write as in a normal "
+    "chat - voice too. Or /add, /task."
 )
 
 
@@ -2818,6 +2963,10 @@ def main():
     application.add_handler(CommandHandler("test_button", test_button))
     application.add_handler(CommandHandler("delete", delete_expense))
 
+    # allow_reentry: SETTINGS_MENU only matches inline callbacks, and the menu
+    # stays open until a completing tap or /cancel. Without reentry a second
+    # /settings (the usual "let me look again" path) matches neither the state
+    # handlers nor /cancel, so PTB drops it in silence.
     conv_settings = ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
@@ -2825,6 +2974,7 @@ def main():
             SETTINGS_TZ_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, settings_tz_search)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
     application.add_handler(conv_settings)
 
@@ -2900,6 +3050,12 @@ def main():
     # states (PLAN_EDITOR etc.) where free text would otherwise fall through.
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_ai_handler)
+    )
+
+    # Voice notes (the microphone button): transcribed, then routed exactly
+    # like the free text above — same AI-mode gate, same rate limit.
+    application.add_handler(
+        MessageHandler(filters.VOICE, voice_ai_handler)
     )
 
     # Any .ics dropped on the bot directly becomes a task right away (unless
