@@ -163,7 +163,7 @@ python scripts/security_audit.py
 python test_bot.py
 ```
 
-Ожидаемый вывод: `Security audit passed` и `All 57 test groups passed`. Тесты
+Ожидаемый вывод: `Security audit passed` и `All 58 test groups passed`. Тесты
 работают на временной базе с временным ключом — реальные данные они не трогают,
 token и `.env` им не нужны.
 
@@ -303,7 +303,7 @@ flowchart LR
 | `ics_import.py` | Ограниченный по размеру парсинг `.ics` |
 | `currency.py` | Кэш курсов и конвертация валют |
 | `utils.py`, `config.py` | Даты и часовые пояса; контракт окружения и пути |
-| `test_bot.py` | Автономный regression-набор из 57 групп |
+| `test_bot.py` | Автономный regression-набор из 58 групп |
 
 ### Осознанные ограничения
 

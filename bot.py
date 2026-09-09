@@ -2211,6 +2211,10 @@ async def edit_expense(update: Update, context: CallbackContext):
         await deny_access(update)
         return ConversationHandler.END
 
+    # A bad id returns None, not END: /edit is re-entrant, so this call may have
+    # arrived while a working menu for another id is still on screen. END would
+    # close that conversation and leave its buttons dead, while None leaves the
+    # state exactly as it was (and no state at all when there was none).
     try:
         user_seq = int(context.args[0])
     except (IndexError, ValueError):
@@ -2219,7 +2223,7 @@ async def edit_expense(update: Update, context: CallbackContext):
             "The id is in /list",
             parse_mode='HTML'
         )
-        return ConversationHandler.END
+        return None
 
     found = await asyncio.to_thread(_find_expense_for_edit_sync, update.effective_user.id, user_seq)
     if found is None:
@@ -2227,7 +2231,7 @@ async def edit_expense(update: Update, context: CallbackContext):
             f"❌ No record with ID {user_seq}. /list",
             parse_mode='HTML',
         )
-        return ConversationHandler.END
+        return None
     context.user_data['edit_expense_id'] = found["id"]
     context.user_data['edit_expense_type'] = found["expense_type"]
     context.user_data['edit_plan_ctx'] = found["expense_data"]  # for the plan editor
@@ -2245,13 +2249,18 @@ async def edit_expense(update: Update, context: CallbackContext):
         keyboard.insert(1, [InlineKeyboardButton("💰 Amount", callback_data="edit_amount")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    menu = await update.message.reply_text(
         f"✏️ <b>Editing ID {user_seq}</b>\n\n"
         f"🔔 Reminders: {found['plan_summary']}\n\n"
         "Field:",
         reply_markup=reply_markup,
         parse_mode='HTML'
     )
+    # /edit is re-entrant, so a second /edit leaves the previous menu on screen
+    # with buttons that still look live. Remember which message is the current
+    # one; edit_field_selected retires any older one instead of applying its
+    # taps to the newest ID.
+    context.user_data['edit_menu_msg_id'] = menu.message_id
     return EDIT_FIELD
 
 
@@ -2260,15 +2269,26 @@ async def edit_field_selected(update: Update, context: CallbackContext):
     query = update.callback_query
     await query.answer()
 
+    menu_msg_id = context.user_data.get('edit_menu_msg_id')
+    if menu_msg_id is not None and query.message and query.message.message_id != menu_msg_id:
+        # Tap on the menu of an earlier /edit: its header names another ID, so
+        # acting on it would change a record the user is not looking at.
+        await query.edit_message_text(
+            "⌛ <b>This menu is out of date</b>\n\n"
+            "/edit was opened again. Use the newest menu, or run /edit ID.",
+            parse_mode='HTML',
+        )
+        return EDIT_FIELD
+
     field = query.data  # edit_title, edit_amount, etc.
     context.user_data['edit_field'] = field.replace('edit_', '')
 
     if field == 'edit_delete':
         # Same mechanics as /delete: one confirmation screen, then the
         # confirm_delete / cancel_delete callbacks in button_callback do the
-        # soft delete. The conversation MUST end here — EDIT_FIELD's
-        # CallbackQueryHandler has no pattern, so while it is alive it would
-        # swallow the ✅/❌ tap and answer with the "✏️ Value:" prompt.
+        # soft delete. The conversation still MUST end here: EDIT_FIELD is
+        # pattern-scoped to edit_ callbacks, but leaving the state alive would
+        # keep answering later stray taps with a field prompt.
         user_seq = context.user_data.get('edit_user_seq')
         if user_seq is None:
             return await _session_lost(context, query.edit_message_text, "/edit ID")
@@ -3017,7 +3037,10 @@ def main():
             PLAN_EDITOR: [CallbackQueryHandler(plan_editor_callback, pattern="^plan_")],
             PLAN_CUSTOM_OFFSET: [MessageHandler(filters.TEXT & ~filters.COMMAND, plan_custom_offset)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
+        # A second /add restarts the dialog instead of being dropped in
+        # silence — none of the states above match a command.
+        allow_reentry=True,
     )
     application.add_handler(conv_add)
 
@@ -3033,7 +3056,8 @@ def main():
             PLAN_EDITOR: [CallbackQueryHandler(plan_editor_callback, pattern="^plan_")],
             PLAN_CUSTOM_OFFSET: [MessageHandler(filters.TEXT & ~filters.COMMAND, plan_custom_offset)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,  # same as /add above
     )
     application.add_handler(conv_task)
 
@@ -3041,7 +3065,10 @@ def main():
     conv_edit = ConversationHandler(
         entry_points=[CommandHandler("edit", edit_expense)],
         states={
-            EDIT_FIELD: [CallbackQueryHandler(edit_field_selected)],
+            # Pattern-scoped on purpose: this state must not take a tap that
+            # belongs to another screen (a stale plan editor, a delete
+            # confirmation), which a re-entered /edit can leave on display.
+            EDIT_FIELD: [CallbackQueryHandler(edit_field_selected, pattern="^edit_")],
             EDIT_VALUE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value),
                 CallbackQueryHandler(edit_period_selected, pattern="^new_period_")
@@ -3055,7 +3082,10 @@ def main():
             PLAN_EDITOR: [CallbackQueryHandler(plan_editor_callback, pattern="^plan_")],
             PLAN_CUSTOM_OFFSET: [MessageHandler(filters.TEXT & ~filters.COMMAND, plan_custom_offset)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
+        # /edit ID while the field menu of another ID is open: without this
+        # the second command matched nothing and the bot went quiet.
+        allow_reentry=True,
     )
     application.add_handler(conv_edit)
 

@@ -42,7 +42,7 @@ follow `SECURITY.md`; deleting the latest line is not enough.
 | `tz_rollback.py` | Time-zone change snapshots and rollback |
 | `monitoring.py` | Optional Telegram alerts for lock and disk conditions |
 | `config.py` | Environment contract, portable state paths, logging |
-| `test_bot.py` | Self-contained 57-group regression suite |
+| `test_bot.py` | Self-contained 58-group regression suite |
 | `scripts/security_audit.py` | Publication-content secret and local-data guard |
 | `scripts/generate_key.py` | Prints a fresh Fernet key for `DB_ENCRYPTION_KEY` |
 | `docs/reminder-plan.md` | Reminder-plan design contract; code comments cite its section numbers |
@@ -85,7 +85,7 @@ python -m compileall -q .
 Expected test marker:
 
 ```text
-[SUCCESS] All 57 test groups passed
+[SUCCESS] All 58 test groups passed
 ```
 
 Do not create `.env` merely to run tests. Do not reuse a developer's existing
@@ -177,15 +177,19 @@ unless the user explicitly wants to delete the persisted database volume.
     message, a quote, or a transcribed voice note can arrive in another
     language, and without the live block the model answers in that language
     instead of the bot's interface language.
-13. Keep `allow_reentry=True` on the `/settings` conversation. Its waiting
-    state matches inline callbacks only, so without the flag a second
-    `/settings` while the menu is open matches neither the state handlers nor
-    `/cancel`, and PTB drops it in silence.
-14. The 🗑 Delete option in the `/edit` menu must end the conversation as it
-    shows the confirmation, and must reuse the `confirm_delete` /
-    `cancel_delete` callbacks. The `EDIT_FIELD` state handler carries no
-    pattern, so a still-live conversation swallows the confirmation tap and
-    answers with a field prompt instead of deleting.
+13. Keep `allow_reentry=True` on every `ConversationHandler`. Their states
+    match inline callbacks or plain text, never a command, so without the
+    flag a repeated `/add`, `/task`, `/edit` or `/settings` matches neither
+    the state handlers nor `/cancel`, and PTB drops it in silence — the bot
+    looks dead. Re-entrancy in turn means an earlier screen can still be on
+    the user's display: `/edit` records the message id of its current menu
+    and retires an older one instead of applying its taps to the newest ID.
+    Keep every conversation state pattern-scoped for the same reason.
+14. The 🗑 Delete option in the `/edit` menu must reuse the `confirm_delete` /
+    `cancel_delete` callbacks and end the conversation as it shows the
+    confirmation. Ending it keeps `EDIT_FIELD` from answering later stray
+    taps with a field prompt, and the confirmation then reaches
+    `button_callback` the same way `/delete`'s does.
 
 ## Change workflow
 
@@ -214,7 +218,7 @@ committing unexpected files. Keep runtime artifacts ignored and out of Git.
 A change is ready only when:
 
 - its requested behavior is implemented and covered by evidence;
-- all 57 test groups pass with an honest process exit code;
+- all 58 test groups pass with an honest process exit code;
 - `ruff check .`, source compilation and `scripts/security_audit.py` pass;
 - README, `.env.example`, privacy text, and agent instructions remain accurate;
 - no real secret, local-machine fingerprint, private infrastructure reference,
