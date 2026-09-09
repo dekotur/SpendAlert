@@ -2432,6 +2432,110 @@ def test_edit_plan_buttons():
         db.close()
 
 
+def test_edit_menu_delete_option():
+    """The /edit menu offers 🗑 Delete, and it runs the /delete mechanics.
+
+    The option hands the record to the same confirm_delete / cancel_delete
+    callbacks /delete uses, and it must end the /edit conversation while doing
+    so: EDIT_FIELD's CallbackQueryHandler carries no pattern, so a still-live
+    conversation would swallow the ✅ tap and answer with the "✏️ Value:"
+    prompt instead of deleting anything.
+    """
+    print("\nTesting the Delete option in the /edit menu...")
+    from telegram.ext import ConversationHandler as _CH
+    import bot as bot_module
+
+    sent = []  # one (text, [callback_data, ...]) per screen the bot showed
+
+    def _screen(text, **kwargs):
+        markup = kwargs.get("reply_markup")
+        rows = markup.inline_keyboard if markup else ()
+        sent.append((text, [b.callback_data for row in rows for b in row]))
+
+    class _Message:
+        async def reply_text(self, text, **kwargs):
+            _screen(text, **kwargs)
+
+    class _Query:
+        def __init__(self, uid, data):
+            self.data = data
+            self.from_user = type("U", (), {"id": uid})()
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text, **kwargs):
+            _screen(text, **kwargs)
+
+    class _Update:
+        def __init__(self, uid, query=None):
+            self.effective_user = type("U", (), {"id": uid})()
+            self.message = None if query else _Message()
+            self.callback_query = query
+
+    class _Ctx:
+        def __init__(self, args):
+            self.args = args
+            self.user_data = {}
+
+    init_db()
+    migrate_db()
+    uid = 700000041
+    tz = _tz_for_local_hour(12)
+    db = SessionLocal()
+    try:
+        db.query(Expense).filter(Expense.user_id == uid).delete(synchronize_session=False)
+        db.query(User).filter(User.id == uid).delete()
+        db.add(User(id=uid, timezone=tz))
+        db.commit()
+        exp = add_expense(db, user_id=uid, title="EditDelete", amount=7.0,
+                          next_payment_date=today_in_tz(tz) + timedelta(days=15), period="month")
+        db.commit()
+        eid, seq = exp.id, exp.user_seq
+
+        ctx = _Ctx([str(seq)])
+        state = asyncio.run(bot_module.edit_expense(_Update(uid), ctx))
+        assert state == bot_module.EDIT_FIELD, state
+        assert "edit_delete" in sent[-1][1], sent[-1][1]
+        assert ctx.user_data["edit_user_seq"] == seq, ctx.user_data
+        print("[OK] the /edit menu offers Delete")
+
+        ended = asyncio.run(bot_module.edit_field_selected(
+            _Update(uid, _Query(uid, "edit_delete")), ctx))
+        assert ended == _CH.END, ended
+        assert ctx.user_data == {"delete_expense_id": eid}, ctx.user_data
+        text, taps = sent[-1]
+        assert taps == ["confirm_delete", "cancel_delete"], taps
+        assert "Delete this payment?" in text, text
+        print("[OK] the tap shows the /delete confirmation and ends /edit")
+
+        asyncio.run(bot_module.button_callback(_Update(uid, _Query(uid, "cancel_delete")), ctx))
+        db.expire_all()
+        assert get_expense_by_user_seq(db, uid, seq).is_active, "cancel must keep the record"
+        print("[OK] cancel keeps the record")
+
+        asyncio.run(bot_module.edit_expense(_Update(uid), ctx))
+        asyncio.run(bot_module.edit_field_selected(
+            _Update(uid, _Query(uid, "edit_delete")), ctx))
+        assert bot_module._confirm_delete_sync(eid, uid + 1) is None  # ownership
+        asyncio.run(bot_module.button_callback(_Update(uid, _Query(uid, "confirm_delete")), ctx))
+        db.expire_all()
+        row = get_expense_by_user_seq(db, uid, seq)
+        assert not row.is_active and row.deactivated_at is not None
+        assert "Deleted" in sent[-1][0], sent[-1][0]
+        print("[OK] confirm soft-deletes the record; another owner cannot")
+
+        db.query(ReminderLog).filter(ReminderLog.expense_id == eid).delete(synchronize_session=False)
+        db.query(Expense).filter(Expense.id == eid).delete(synchronize_session=False)
+        db.query(User).filter(User.id == uid).delete()
+        db.commit()
+    except Exception as e:
+        print(f"[ERROR] /edit menu delete option: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
 def test_ai_mode_toggle_and_routing():
     """Permanent AI flag: default OFF, toggle persists, free-text routing gates,
     snapshot/restore round-trips ai_mode. Drives shipped DB + bot helpers."""
@@ -3512,6 +3616,7 @@ TESTS = [
     test_reminder_reschedule_buttons,
     test_legacy_snooze_migration,
     test_edit_plan_buttons,
+    test_edit_menu_delete_option,
     test_recur_anchor,
     test_ai_set_reminder_plan,
     test_ai_create_task_returns_user_seq,

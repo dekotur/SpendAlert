@@ -2,6 +2,20 @@
 
 All notable public changes are documented here.
 
+## 1.2.0 - 2026-09-09
+
+### Added
+
+- A 🗑 Delete option in the `/edit` menu. It runs the same mechanics as
+  `/delete`: one confirmation screen showing the record, then the same
+  confirm/cancel buttons and the same soft delete. Deleting no longer needs a
+  second command and a second look at the id.
+
+### Changed
+
+- The regression suite is 57 groups: the new one drives the `/edit` menu tap
+  through confirmation, cancellation and the ownership check.
+
 ## 1.1.0 - 2026-09-08
 
 ### Added
