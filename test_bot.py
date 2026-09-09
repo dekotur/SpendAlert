@@ -2712,8 +2712,12 @@ def test_conversation_command_reentry():
 
         ctx = _Ctx([str(first.user_seq)])
         asyncio.run(bot_module.edit_expense(_Upd(msg_id=101), ctx))
+        # The menu must name the record, not only its id - that is what makes
+        # a stale menu recognizable in the chat.
+        assert "First" in screens[-1], screens[-1]
         ctx.args = [str(second.user_seq)]
         asyncio.run(bot_module.edit_expense(_Upd(msg_id=102), ctx))
+        assert "Second" in screens[-1], screens[-1]
         assert ctx.user_data["edit_menu_msg_id"] == 102, ctx.user_data
         assert ctx.user_data["edit_expense_id"] == second.id, ctx.user_data
 
