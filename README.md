@@ -159,7 +159,7 @@ python scripts/security_audit.py
 python test_bot.py
 ```
 
-Expected output: `Security audit passed` and `All 56 test groups passed`. The
+Expected output: `Security audit passed` and `All 57 test groups passed`. The
 suite uses a throwaway database and a throwaway key — it never touches your real
 data, and it needs no token and no `.env`.
 
@@ -254,7 +254,7 @@ use the same key and the same account balance as typed requests.
 | `/add` | Adds a payment, step by step |
 | `/task` | Adds a task, step by step |
 | `/list` | Active records with the nearest due dates |
-| `/edit ID` | Changes a record and its reminder plan |
+| `/edit ID` | Changes a record and its reminder plan, or deletes it |
 | `/delete ID` | Deletes a record after confirmation |
 | `/settings` | Time zone, currency, quiet hours, reminder hour, sorting |
 | `/ai` | Turns the persistent AI assistant on or off. While it is on, plain messages and voice messages both reach it |
@@ -299,7 +299,7 @@ flowchart LR
 | `ics_import.py` | Bounded `.ics` parsing |
 | `currency.py` | Exchange-rate cache and conversion |
 | `utils.py`, `config.py` | Dates and time zones; environment contract and paths |
-| `test_bot.py` | Self-contained 56-group regression suite |
+| `test_bot.py` | Self-contained 57-group regression suite |
 
 ### Deliberate limits
 

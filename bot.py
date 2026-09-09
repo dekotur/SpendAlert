@@ -136,7 +136,7 @@ HELP_TEXT = (
     "/add - a payment, step by step\n"
     "/task - a task, step by step\n"
     "/list - my list\n"
-    "/edit 2 - change a record, including its reminders\n"
+    "/edit 2 - change a record, including its reminders, or delete it\n"
     "/delete 2 - delete a record\n"
     "/settings - time zone, currency, reminder hour, quiet hours, sorting\n"
     "/privacy - data processing\n"
@@ -2231,6 +2231,7 @@ async def edit_expense(update: Update, context: CallbackContext):
     context.user_data['edit_expense_id'] = found["id"]
     context.user_data['edit_expense_type'] = found["expense_type"]
     context.user_data['edit_plan_ctx'] = found["expense_data"]  # for the plan editor
+    context.user_data['edit_user_seq'] = user_seq  # for the 🗑 Delete option
 
     # Show edit options
     keyboard = [
@@ -2238,6 +2239,7 @@ async def edit_expense(update: Update, context: CallbackContext):
         [InlineKeyboardButton("📅 Date", callback_data="edit_date")],
         [InlineKeyboardButton("🔄 Recurrence", callback_data="edit_period")],
         [InlineKeyboardButton("🔔 Reminders", callback_data="edit_plan")],
+        [InlineKeyboardButton("🗑 Delete", callback_data="edit_delete")],
     ]
     if context.user_data.get('edit_expense_type') != 'task':
         keyboard.insert(1, [InlineKeyboardButton("💰 Amount", callback_data="edit_amount")])
@@ -2260,6 +2262,27 @@ async def edit_field_selected(update: Update, context: CallbackContext):
 
     field = query.data  # edit_title, edit_amount, etc.
     context.user_data['edit_field'] = field.replace('edit_', '')
+
+    if field == 'edit_delete':
+        # Same mechanics as /delete: one confirmation screen, then the
+        # confirm_delete / cancel_delete callbacks in button_callback do the
+        # soft delete. The conversation MUST end here — EDIT_FIELD's
+        # CallbackQueryHandler has no pattern, so while it is alive it would
+        # swallow the ✅/❌ tap and answer with the "✏️ Value:" prompt.
+        user_seq = context.user_data.get('edit_user_seq')
+        if user_seq is None:
+            return await _session_lost(context, query.edit_message_text, "/edit ID")
+        info = await asyncio.to_thread(
+            _prepare_delete_confirmation_sync, query.from_user.id, user_seq,
+        )
+        if info is None:
+            await query.edit_message_text("❌ Record not found.", parse_mode='HTML')
+            context.user_data.clear()
+            return ConversationHandler.END
+        context.user_data.clear()
+        context.user_data['delete_expense_id'] = info['expense_id']
+        await _ask_delete_confirmation(query.edit_message_text, info)
+        return ConversationHandler.END
 
     if field == 'edit_plan':
         expense_id = context.user_data.get('edit_expense_id')
@@ -2556,6 +2579,24 @@ def _prepare_delete_confirmation_sync(owner_id: int, user_seq: int) -> dict | No
         return {"expense_id": expense.id, "record_type": record_type, "detail": detail}
 
 
+async def _ask_delete_confirmation(send, info: dict) -> None:
+    """Render the delete confirmation screen. `send` is update.message.reply_text
+    for /delete and query.edit_message_text for the 🗑 Delete option in /edit, so
+    both entry points show the same text and the same pair of callbacks."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Delete", callback_data="confirm_delete"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_delete"),
+        ]
+    ]
+    await send(
+        f"⚠️ <b>Delete this {info['record_type']}?</b>\n\n"
+        f"{info['detail']}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode='HTML',
+    )
+
+
 async def delete_expense(update: Update, context: CallbackContext):
     """Delete expense with confirmation."""
     if not await is_registered_user(update.effective_user.id):
@@ -2583,21 +2624,7 @@ async def delete_expense(update: Update, context: CallbackContext):
         return
 
     context.user_data['delete_expense_id'] = info['expense_id']
-
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Delete", callback_data="confirm_delete"),
-            InlineKeyboardButton("❌ Cancel", callback_data="cancel_delete"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(
-        f"⚠️ <b>Delete this {info['record_type']}?</b>\n\n"
-        f"{info['detail']}",
-        reply_markup=reply_markup,
-        parse_mode='HTML',
-    )
+    await _ask_delete_confirmation(update.message.reply_text, info)
 
 
 def _confirm_delete_sync(expense_id: int, owner_id: int) -> str | None:
