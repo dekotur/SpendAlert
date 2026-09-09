@@ -2,6 +2,16 @@
 
 All notable public changes are documented here.
 
+## 1.2.2 - 2026-09-09
+
+### Changed
+
+- The `/edit` menu now names the record it is editing. The header carried the
+  id and the reminder plan only, so the screen that offers to replace a
+  title, a date or an amount never said which record it belonged to. The
+  full title is shown, notes included, because a title edit replaces all of
+  it.
+
 ## 1.2.1 - 2026-09-09
 
 ### Fixed

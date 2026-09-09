@@ -2251,6 +2251,9 @@ async def edit_expense(update: Update, context: CallbackContext):
 
     menu = await update.message.reply_text(
         f"✏️ <b>Editing ID {user_seq}</b>\n\n"
+        # The whole title, notes included: a title edit replaces all of it, and
+        # /edit is the one screen where the id alone says nothing.
+        f"📌 {html.escape(found['title'])}\n"
         f"🔔 Reminders: {found['plan_summary']}\n\n"
         "Field:",
         reply_markup=reply_markup,
