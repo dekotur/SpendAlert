@@ -159,7 +159,7 @@ python scripts/security_audit.py
 python test_bot.py
 ```
 
-Expected output: `Security audit passed` and `All 57 test groups passed`. The
+Expected output: `Security audit passed` and `All 58 test groups passed`. The
 suite uses a throwaway database and a throwaway key — it never touches your real
 data, and it needs no token and no `.env`.
 
@@ -299,7 +299,7 @@ flowchart LR
 | `ics_import.py` | Bounded `.ics` parsing |
 | `currency.py` | Exchange-rate cache and conversion |
 | `utils.py`, `config.py` | Dates and time zones; environment contract and paths |
-| `test_bot.py` | Self-contained 57-group regression suite |
+| `test_bot.py` | Self-contained 58-group regression suite |
 
 ### Deliberate limits
 

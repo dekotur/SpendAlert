@@ -2452,14 +2452,18 @@ def test_edit_menu_delete_option():
         rows = markup.inline_keyboard if markup else ()
         sent.append((text, [b.callback_data for row in rows for b in row]))
 
+    menu_msg_id = 500
+
     class _Message:
         async def reply_text(self, text, **kwargs):
             _screen(text, **kwargs)
+            return type("M", (), {"message_id": menu_msg_id})()
 
     class _Query:
         def __init__(self, uid, data):
             self.data = data
             self.from_user = type("U", (), {"id": uid})()
+            self.message = type("M", (), {"message_id": menu_msg_id})()
 
         async def answer(self):
             pass
@@ -2531,6 +2535,217 @@ def test_edit_menu_delete_option():
         db.commit()
     except Exception as e:
         print(f"[ERROR] /edit menu delete option: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def test_conversation_command_reentry():
+    """A command that opens a conversation must be accepted while that same
+    conversation is still open.
+
+    Reported from a live chat: `/edit 22` drew the field menu, the following
+    `/edit 6` was answered by nothing at all. The menu's state matches inline
+    callbacks only, so without allow_reentry the repeated command matches
+    neither the state handlers nor `/cancel`, and PTB drops it in silence -
+    the bot looks dead until the user taps a button or /cancel. `/add` and
+    `/task` have the same shape: their states match plain text, never a
+    command.
+
+    EDIT_FIELD also needs its own callback pattern. Re-entry can park the
+    conversation there while an older screen's buttons are still on the
+    user's display, and a pattern-less state handler would take those taps
+    too and answer them with a field prompt.
+    """
+    print("\nTesting a repeated command while its conversation is open...")
+    import re as _re
+    import warnings as _warnings
+    from datetime import datetime as _dt, timezone as _tz
+    from telegram import (
+        Update as _Update, Message as _Message, User as _TGUser,
+        Chat as _TGChat, MessageEntity as _ME,
+    )
+    from telegram.ext import (
+        ConversationHandler as _CH, CommandHandler as _Cmd,
+        CallbackQueryHandler as _CQ, MessageHandler as _MH, filters as _filters,
+    )
+    import bot as bot_module
+
+    class _DummyBot:
+        username = "testbot"
+        defaults = None
+
+    def _edit_conv(allow_reentry: bool):
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            return _CH(
+                entry_points=[_Cmd("edit", bot_module.edit_expense)],
+                states={
+                    bot_module.EDIT_FIELD: [_CQ(
+                        bot_module.edit_field_selected, pattern="^edit_",
+                    )],
+                    bot_module.EDIT_VALUE: [_MH(
+                        _filters.TEXT & ~_filters.COMMAND, bot_module.edit_value,
+                    )],
+                },
+                fallbacks=[_Cmd("cancel", bot_module.cancel)],
+                allow_reentry=allow_reentry,
+            )
+
+    try:
+        tg_user = _TGUser(id=43, first_name="T", is_bot=False)
+        chat = _TGChat(id=43, type="private")
+        entity = _ME(type=_ME.BOT_COMMAND, offset=0, length=len("/edit"))
+        message = _Message(
+            message_id=1,
+            date=_dt.now(_tz.utc),
+            chat=chat,
+            from_user=tg_user,
+            text="/edit 6",
+            entities=(entity,),
+        )
+        dummy = _DummyBot()
+        message.set_bot(dummy)
+        update = _Update(update_id=1, message=message)
+        update.set_bot(dummy)
+        key = (chat.id, tg_user.id)
+
+        stuck = _edit_conv(allow_reentry=False)
+        stuck._conversations[key] = bot_module.EDIT_FIELD
+        assert stuck.check_update(update) is None, (
+            "without allow_reentry a second /edit must be the silent drop"
+        )
+
+        fixed = _edit_conv(allow_reentry=True)
+        fixed._conversations[key] = bot_module.EDIT_FIELD
+        check = fixed.check_update(update)
+        assert check is not None, "allow_reentry=True must accept a second /edit"
+        _state, _key, handler, _inner = check
+        assert handler.commands == {"edit"}, handler.commands
+        print("[OK] a second /edit re-enters the field menu")
+
+        # /edit answers a bad id with None instead of END so a menu already on
+        # screen keeps working. That relies on PTB reading None as "leave the
+        # state as it is" - pin the assumption, it is not ours.
+        fixed._conversations[key] = bot_module.EDIT_FIELD
+        fixed._update_state(None, key)
+        assert fixed._conversations[key] == bot_module.EDIT_FIELD, fixed._conversations
+
+        # Every shipped conversation must carry the flag, not only /settings.
+        src_path = os.path.join(os.path.dirname(__file__), "bot.py")
+        bot_src = open(src_path, encoding="utf-8").read()
+        names = _re.findall(r"(conv_\w+) = ConversationHandler\(", bot_src)
+        assert {"conv_settings", "conv_add", "conv_task", "conv_edit"} <= set(names), names
+        for name in names:
+            start = bot_src.find(f"{name} = ConversationHandler(")
+            end = bot_src.find(f"application.add_handler({name})", start)
+            assert end > start, f"{name}: registration not found"
+            assert "allow_reentry=True" in bot_src[start:end], (
+                f"{name}: a repeated command would be dropped in silence"
+            )
+        print(f"[OK] all {len(names)} shipped conversations set allow_reentry")
+
+        conv_edit_src = bot_src[
+            bot_src.find("conv_edit = ConversationHandler("):
+            bot_src.find("application.add_handler(conv_edit)")
+        ]
+        assert 'EDIT_FIELD: [CallbackQueryHandler(edit_field_selected, pattern="^edit_")]' in conv_edit_src, (
+            "EDIT_FIELD must take only its own edit_ callbacks"
+        )
+        print("[OK] EDIT_FIELD is scoped to its own callbacks")
+    except Exception as e:
+        print(f"[ERROR] repeated-command reentry: {e}")
+        return
+
+    # Re-entry leaves the first menu on screen with buttons that still look
+    # live. A tap on it must not edit the record the second /edit opened.
+    print("Testing a tap on the menu of an earlier /edit...")
+    init_db()
+    migrate_db()
+    uid = 700000042
+    tz = _tz_for_local_hour(12)
+    screens = []  # text of every screen the bot drew
+
+    class _Reply:
+        def __init__(self, msg_id):
+            self.msg_id = msg_id
+
+        async def reply_text(self, text, **kwargs):
+            screens.append(text)
+            return type("M", (), {"message_id": self.msg_id})()
+
+    class _Tap:
+        def __init__(self, data, msg_id):
+            self.data = data
+            self.from_user = type("U", (), {"id": uid})()
+            self.message = type("M", (), {"message_id": msg_id})()
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text, **kwargs):
+            screens.append(text)
+
+    class _Upd:
+        def __init__(self, msg_id=None, query=None):
+            self.effective_user = type("U", (), {"id": uid})()
+            self.message = None if query else _Reply(msg_id)
+            self.callback_query = query
+
+    class _Ctx:
+        def __init__(self, args):
+            self.args = args
+            self.user_data = {}
+
+    db = SessionLocal()
+    try:
+        db.query(Expense).filter(Expense.user_id == uid).delete(synchronize_session=False)
+        db.query(User).filter(User.id == uid).delete()
+        db.add(User(id=uid, timezone=tz))
+        db.commit()
+        due = today_in_tz(tz) + timedelta(days=10)
+        first = add_expense(db, user_id=uid, title="First", amount=1.0,
+                            next_payment_date=due, period="month")
+        second = add_expense(db, user_id=uid, title="Second", amount=2.0,
+                             next_payment_date=due, period="month")
+        db.commit()
+
+        ctx = _Ctx([str(first.user_seq)])
+        asyncio.run(bot_module.edit_expense(_Upd(msg_id=101), ctx))
+        ctx.args = [str(second.user_seq)]
+        asyncio.run(bot_module.edit_expense(_Upd(msg_id=102), ctx))
+        assert ctx.user_data["edit_menu_msg_id"] == 102, ctx.user_data
+        assert ctx.user_data["edit_expense_id"] == second.id, ctx.user_data
+
+        # A bad id must not close the conversation of the menu still on screen.
+        ctx.args = ["999"]
+        bad = asyncio.run(bot_module.edit_expense(_Upd(msg_id=103), ctx))
+        assert bad is None, bad
+        assert "No record with ID 999" in screens[-1], screens[-1]
+        assert ctx.user_data["edit_menu_msg_id"] == 102, ctx.user_data
+        assert ctx.user_data["edit_expense_id"] == second.id, ctx.user_data
+        print("[OK] a bad id leaves the open menu alive")
+
+        stale = asyncio.run(bot_module.edit_field_selected(
+            _Upd(query=_Tap("edit_title", 101)), ctx))
+        assert stale == bot_module.EDIT_FIELD, stale
+        assert "out of date" in screens[-1], screens[-1]
+        assert ctx.user_data["edit_expense_id"] == second.id, ctx.user_data
+        assert "edit_field" not in ctx.user_data, ctx.user_data
+
+        current = asyncio.run(bot_module.edit_field_selected(
+            _Upd(query=_Tap("edit_title", 102)), ctx))
+        assert current == bot_module.EDIT_VALUE, current
+        assert ctx.user_data["edit_field"] == "title", ctx.user_data
+        print("[OK] the older menu is retired; the newest one still works")
+
+        db.query(ReminderLog).filter(
+            ReminderLog.expense_id.in_([first.id, second.id])).delete(synchronize_session=False)
+        db.query(Expense).filter(Expense.user_id == uid).delete(synchronize_session=False)
+        db.query(User).filter(User.id == uid).delete()
+        db.commit()
+    except Exception as e:
+        print(f"[ERROR] stale /edit menu: {e}")
         db.rollback()
     finally:
         db.close()
@@ -3617,6 +3832,7 @@ TESTS = [
     test_legacy_snooze_migration,
     test_edit_plan_buttons,
     test_edit_menu_delete_option,
+    test_conversation_command_reentry,
     test_recur_anchor,
     test_ai_set_reminder_plan,
     test_ai_create_task_returns_user_seq,

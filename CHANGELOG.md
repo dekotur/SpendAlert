@@ -2,6 +2,20 @@
 
 All notable public changes are documented here.
 
+## 1.2.1 - 2026-09-09
+
+### Fixed
+
+- `/edit ID` did nothing at all when the field menu of another record was
+  still open - the bot simply went quiet. A conversation's waiting states
+  match inline buttons or plain text but never a command, so the repeated
+  command matched neither them nor `/cancel` and was dropped in silence.
+  `/add` and `/task` had the same defect; all conversations are now
+  re-entrant, as `/settings` already was.
+- A tap on the field menu of an earlier `/edit` would have changed whichever
+  record the newest `/edit` opened, while the menu on screen named a
+  different ID. The older menu is now retired with a note instead.
+
 ## 1.2.0 - 2026-09-09
 
 ### Added
@@ -13,8 +27,10 @@ All notable public changes are documented here.
 
 ### Changed
 
-- The regression suite is 57 groups: the new one drives the `/edit` menu tap
-  through confirmation, cancellation and the ownership check.
+- The regression suite is 58 groups: one drives the `/edit` menu tap through
+  confirmation, cancellation and the ownership check; the other proves a
+  repeated command re-enters its conversation and that a stale menu is
+  retired.
 
 ## 1.1.0 - 2026-09-08
 
