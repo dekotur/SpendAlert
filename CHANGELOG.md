@@ -2,6 +2,15 @@
 
 All notable public changes are documented here.
 
+## 1.2.3 - 2026-09-10
+
+### Fixed
+
+- The reminder **Tomorrow** button added a day and then jumped to the user's
+  reminder hour (09:00 or 10:00). It now moves the due datetime by 24 hours
+  from the tap, keeping that clock time, the same way **+3 hours** already
+  does.
+
 ## 1.2.2 - 2026-09-09
 
 ### Changed
