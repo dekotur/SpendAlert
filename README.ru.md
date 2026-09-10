@@ -19,7 +19,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo-hero.png" width="100%" alt="SpendAlert: платежи, задачи, календарь и напоминания в одном Telegram-боте">
+  <img src="assets/demo-ru.webp" width="100%" alt="Демонстрация SpendAlert: платёж и задача созданы обычным текстом, напоминание закрыто одним нажатием">
+</p>
+
+<p align="center">
+  <sub>Демонстрация идёт без звука &middot; <a href="assets/demo-ru.mp4">тот же 10-секундный клип со звуком</a> (MP4, 4 МБ)</sub>
 </p>
 
 <p align="center">
