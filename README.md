@@ -19,7 +19,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo-hero.png" width="100%" alt="SpendAlert: payments, tasks, calendar events and reminders in one Telegram bot">
+  <img src="assets/demo-en.webp" width="100%" alt="SpendAlert demo: a payment and a task created from plain text, then closed with one tap on the reminder">
+</p>
+
+<p align="center">
+  <sub>The demo plays without sound &middot; <a href="assets/demo-en.mp4">the same 10-second clip with sound</a> (MP4, 4 MB)</sub>
 </p>
 
 <p align="center">
