@@ -23,10 +23,6 @@
 </p>
 
 <p align="center">
-  <sub>Демонстрация идёт без звука &middot; <a href="assets/demo-ru.mp4">тот же 10-секундный клип со звуком</a> (MP4, 4 МБ)</sub>
-</p>
-
-<p align="center">
   <a href="README.md">English</a> ·
   <b>Русский</b>
 </p>
