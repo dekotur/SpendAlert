@@ -2770,8 +2770,7 @@ def _reschedule_from_reminder_sync(owner_id: int, user_seq: int, code: str) -> d
         if code == "3h":
             due_local = now_local + timedelta(hours=3)
         elif code == "1d":
-            hour = get_user_reminder_hour(db, owner_id)
-            due_local = (now_local + timedelta(days=1)).replace(hour=hour, minute=0)
+            due_local = now_local + timedelta(days=1)
         else:
             return {"status": "bad_code"}
 

@@ -2279,14 +2279,18 @@ def test_reminder_reschedule_buttons():
         db.commit()
         tomorrow_seq, plus_three_seq = tomorrow_task.user_seq, plus_three_task.user_seq
 
+        before = now_in_tz(tz).replace(second=0, microsecond=0)
         result = _reschedule_from_reminder_sync(uid, tomorrow_seq, "1d")
+        after = now_in_tz(tz).replace(second=0, microsecond=0)
         assert result["status"] == "ok"
+        assert before + timedelta(days=1) <= result["due_local"] <= after + timedelta(days=1)
         db.expire_all()
         moved = get_expense_by_user_seq(db, uid, tomorrow_seq)
-        assert moved.next_payment_date == today + timedelta(days=1)
-        assert moved.reminder_time == "10:00"
+        assert moved.next_payment_date == result["due_local"].date()
+        assert moved.reminder_time == result["due_local"].strftime("%H:%M")
+        assert moved.reminder_time != "10:00"
         assert to_user_tz(moved.next_reminder_at, tz).strftime("%Y-%m-%d %H:%M") == \
-            f"{moved.next_payment_date.isoformat()} 10:00"
+            result["due_local"].strftime("%Y-%m-%d %H:%M")
         assert moved.reminder_slot and moved.reminder_slot.startswith("n")
         assert moved.reminder_slot_sends == 1
         print("[OK] Tomorrow rewrites due date/time and consumes today's pre-due wave")
